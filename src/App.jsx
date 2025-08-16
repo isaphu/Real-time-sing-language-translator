@@ -19,6 +19,7 @@ export default function RealTimeSignTranslator() {
   const [showSaved, setShowSaved] = useState(false);
   const [input, setInput] = useState("");
   const [transcript, setTranscript] = useState(() => seed);
+  const [hasExported, setHasExported] = useState(false);
 
   const chatRef = useRef(null);
 
@@ -70,6 +71,7 @@ export default function RealTimeSignTranslator() {
 
   const confirmEndTranslation = () => {
     setShowEndModal(false);
+    setHasExported(false);
     setStep(2);
   };
 
@@ -84,13 +86,24 @@ export default function RealTimeSignTranslator() {
     });
   };
 
-  const onExport = () => exportTranscriptPDF(transcript);
+  //pdf export
+  const onExport = () => {
+    setHasExported(true);// mark as exported
+    exportTranscriptPDF(transcript);
+  };
 
   // Step 3 > Start New Translation flow with warning & optional export
-  const requestRestart = () => setShowRestartModal(true);
+  const requestRestart = () => {
+    if (hasExported) {
+      restartWithoutExport(); // immediate restart (no warning)
+    } else {
+      setShowRestartModal(true); // show warning modal
+    }
+  };
 
   const restartWithoutExport = () => {
     setShowRestartModal(false);
+    setHasExported(false);
     setTranscript([]);
     setInput("");
     setStep(0);
@@ -100,6 +113,7 @@ export default function RealTimeSignTranslator() {
     exportTranscriptPDF(transcript);
     setShowRestartModal(false);
     setTimeout(() => {
+      setHasExported(false);
       setTranscript([]);
       setInput("");
       setStep(0);

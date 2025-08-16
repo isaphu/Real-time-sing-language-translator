@@ -6,3 +6,5 @@ export const initialTranscript = [
   { role: "DHH", text: "Can I use my driver's license.", timestamp: nowISO() },
   { role: "STAFF", text: "Sure.", timestamp: nowISO() },
 ];
+
+export default initialTranscript; 

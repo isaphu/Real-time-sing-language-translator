@@ -1,4 +1,5 @@
 import React from "react";
+import VideoPreview from "./VideoPreview";
 import { formatTimestamp } from "../utils/time";
 
 export default function Translation({
@@ -9,6 +10,9 @@ export default function Translation({
   input,
   setInput,
   onSend,
+  videoRef,
+  canvasRef,
+  cameraOn,
 }) {
   return (
     <div>
@@ -20,9 +24,9 @@ export default function Translation({
           </button>
         </div>
       </div>
-      <div className="border rounded-2xl h-36 mb-3 flex items-center justify-center text-neutral-400">
-        Video Preview
-      </div>
+
+      <VideoPreview videoRef={videoRef} canvasRef={canvasRef} cameraOn={cameraOn} />
+
       <div ref={chatRef} className={`border rounded-2xl h-48 p-3 overflow-auto bg-neutral-50 ${fontClass}`}>
         {transcript.map((m, i) => (
           <div key={i} className="mb-3">

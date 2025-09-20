@@ -1,5 +1,3 @@
-// src/terms_condition.js
-
 const termsText = `
 Real-time Sign Language Translator — Terms and Conditions
 

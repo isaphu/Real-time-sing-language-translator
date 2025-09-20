@@ -30,7 +30,7 @@ export default function useCamera() {
     setCameraOn(false);
   }, []);
 
-  // Safety: stop camera if component unmounts
+  // for safety stop camera if unmount
   useEffect(() => () => stopCamera(), [stopCamera]);
 
   return { videoRef, canvasRef, cameraOn, startCamera, stopCamera };

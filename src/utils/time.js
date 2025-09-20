@@ -19,7 +19,7 @@ export function pad2(n) {
     }
   }
   
-  // Export timestamp (PDF): DD/MM/YY, HH:MM:SS AM/PM
+  // formatr timestamp > (PDF): DD/MM/YY, HH:MM:SS AM/PM
   export function formatDDMMYY(date) {
     const d = new Date(date);
     if (isNaN(d.getTime())) return "";

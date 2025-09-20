@@ -7,6 +7,13 @@ import Complete from "./components/Complete";
 
 import useCamera from "./hooks/useCamera";
 import initialTranscript from "./data/initialTranscript";
+// MediaPipe 
+import useGestureRecognizer from "./hooks/useGestureRecognizer";
+// Custom TF.js 
+import useTrainedGesture from "./hooks/useTrainedGesture";
+
+import { landmarksToFeatures } from "./utils/feat";
+import { createGestureInterpreter } from "./utils/gestureRules";
 import { nowISO } from "./utils/time";
 import { exportTranscriptPDF } from "./utils/pdf";
 
@@ -21,9 +28,16 @@ export default function App() {
 
   const [input, setInput] = useState("");
   const [transcript, setTranscript] = useState(() => initialTranscript);
-
-  // NEW: track if current session has been exported
   const [hasExported, setHasExported] = useState(false);
+
+  // model preference: "auto" | "custom" | "mp"
+  const [modelPref, setModelPref] = useState(
+    () => localStorage.getItem("modelPref") || "auto"
+  );
+
+  // debug HUD state (throttled updates to avoid re-rendering every frame)
+  const [debug, setDebug] = useState(null);
+  const lastDebugAtRef = useRef(0);
 
   const chatRef = useRef(null);
 
@@ -35,37 +49,83 @@ export default function App() {
     return "text-2xl";
   }, [fontScale]);
 
-  // ---- Camera (hook) ----
-  const { videoRef, canvasRef, cameraOn, startCamera, stopCamera } = useCamera();
+  // phrase mapping for 10 custom classes
+  const CUSTOM_MAP = {
+    hello: "Hello",
+    bye: "Bye",
+    thankyou: "Thank you",
+    yes: "Yes",
+    no: "No",
+    please: "Please",
+    water: "Water",
+    drink: "Drink",
+    book: "Book",
+    where: "Where",
+  };
 
-  // Helper: clean state & go to Terms
+  // ---- Hooks ----
+  const { videoRef, canvasRef, cameraOn, startCamera, stopCamera } = useCamera();
+  const { recognizerRef, ready: mpReady } = useGestureRecognizer(); // MediaPipe
+
+  // useTrainedGesture returns step() that does scaling + smoothing internally
+  const {
+    ready: customReady,
+    // -> { emit|null, score, rawTop, rawProbs }
+    step: customStep, 
+    labels: customLabels,
+    reset: customReset,
+  } = useTrainedGesture(
+    "/models/sign10/model.json",
+    "/models/sign10/labels.json",
+    "/models/sign10/scaler.json"
+  );
+
+  // One interpreter for both sources
+  const interpreterRef = useRef(
+    createGestureInterpreter({
+      cooldownMs: 700,       // ★ was 900
+      builtInMinScore: 0.6,
+      customMinScore: 0.35,  // ★ was 0.4
+      customMap: CUSTOM_MAP,
+    })
+  );
+
+  // ---- Helpers ----
+  const appendSignerText = (text) => {
+    setTranscript((t) => [...t, { role: "DHH", text, timestamp: nowISO() }]);
+    requestAnimationFrame(() => {
+      chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: "smooth" });
+    });
+  };
+
   const resetToTerms = () => {
     setTranscript([]);
     setInput("");
-    setHasExported(false);  // reset export flag for next session
+    setHasExported(false);
     setStep(0);
+    interpreterRef.current.reset();
+    customReset?.();
   };
 
-  // Start from Terms -> Translation
+  //flow actions 
   const onStart = async () => {
     setTranscript([]);
     setInput("");
-    setHasExported(false);  // NEW: new session hasn't exported yet
+    setHasExported(false);
     setStep(1);
-    await startCamera(); // turn on webcam entering Translation
+    await startCamera();
+    interpreterRef.current.reset();
+    customReset?.();
   };
 
-  // Close pressed in Translation -> confirm modal
   const onClose = () => setShowEndModal(true);
 
-  // Confirm end translation -> to Complete (stop camera)
   const confirmEndTranslation = () => {
     setShowEndModal(false);
     stopCamera();
     setStep(2);
   };
 
-  // Send message (STAFF side for now)
   const onSend = () => {
     const trimmed = input.trim();
     if (!trimmed) return;
@@ -76,41 +136,20 @@ export default function App() {
     });
   };
 
-  // Export PDF (plain text 12pt)
   const onExport = () => {
     exportTranscriptPDF(transcript);
-    setHasExported(true); // NEW: mark as exported
+    setHasExported(true);
   };
 
-  // Step 3 restart options
-  // NEW: only show warning modal if NOT exported; otherwise jump straight to Terms
-  const requestRestart = () => {
-    if (hasExported) {
-      resetToTerms();   // no warning needed
-    } else {
-      setShowRestartModal(true); // show Export/Start Without Export/Cancel
-    }
-  };
+  const requestRestart = () => (hasExported ? resetToTerms() : setShowRestartModal(true));
+  const restartWithoutExport = () => { setShowRestartModal(false); resetToTerms(); };
+  const exportThenRestart = () => { onExport(); setShowRestartModal(false); setTimeout(() => resetToTerms(), 0); };
 
-  const restartWithoutExport = () => {
-    setShowRestartModal(false);
-    resetToTerms();
-  };
-
-  const exportThenRestart = () => {
-    onExport(); // sets hasExported = true
-    setShowRestartModal(false);
-    setTimeout(() => {
-      resetToTerms();
-    }, 0);
-  };
-
-  // Safety: stop camera any time we leave step 1
   useEffect(() => {
     if (step !== 1) stopCamera();
   }, [step, stopCamera]);
 
-  // -------- mirror video into canvas + overlay hook --------
+  //draw loop: mirror video + recognition (pref aware) 
   useEffect(() => {
     if (!cameraOn) return;
     let raf = 0;
@@ -121,33 +160,133 @@ export default function App() {
 
     const loop = () => {
       if (v && ctx && v.readyState >= 2) {
-        // Match the canvas INTERNAL pixels to the DISPLAYED size of the canvas element
+        // sync canvas internal size to css size
         const rect = c.getBoundingClientRect();
         const cssW = Math.max(1, Math.floor(rect.width));
         const cssH = Math.max(1, Math.floor(rect.height));
-        if (c.width !== cssW || c.height !== cssH) {
-          c.width = cssW;
-          c.height = cssH;
-        }
+        if (c.width !== cssW || c.height !== cssH) { c.width = cssW; c.height = cssH; }
 
-        // Clear and draw the mirrored video scaled to the canvas box
+        // mirror video
         ctx.clearRect(0, 0, c.width, c.height);
         ctx.save();
-        ctx.translate(c.width, 0);   // move origin to the right edge
-        ctx.scale(-1, 1);            // mirror horizontally
+        ctx.translate(c.width, 0);
+        ctx.scale(-1, 1);
         ctx.drawImage(v, 0, 0, c.width, c.height);
         ctx.restore();
 
-        // TODO: draw overlays (e.g., landmarks) here
+        // 1) MediaPipe landmarks (used by both)
+        let lm = null, mpLabel = null, mpScore = 0;
+        if (mpReady && recognizerRef.current) {
+          const res = recognizerRef.current.recognizeForVideo(v, performance.now());
+          lm = res?.landmarks?.[0] || null;
+          const top = res?.gestures?.[0]?.[0];
+          mpLabel = top?.categoryName || null;
+          mpScore = top?.score ?? 0;
+        }
+
+        // 2) Custom model path (uses smoothing inside hook)
+        let dbgCustomLabel = null;
+        let dbgCustomScore = 0;
+
+        const tryCustom = () => {
+          if (!customReady || !lm) return null;
+          const feat = landmarksToFeatures(lm); // 63-D wrist-relative
+          if (!feat) return null;
+
+          const res = customStep(feat); // { emit|null, score, rawTop, rawProbs }
+          if (!res) return null;
+
+          const topLabel = res.rawTop?.label ?? null;   // ★
+          const topScore = res.rawTop?.score ?? 0;      // ★
+          dbgCustomLabel = topLabel;
+          dbgCustomScore = topScore;
+
+          // If the smoother says "emit", route through interpreter (for mapping/cooldown)
+          if (res.emit) {
+            return (
+              interpreterRef.current.step({
+                label: res.emit.toLowerCase(),
+                score: res.score ?? 1,
+                landmarks: lm,
+                now: performance.now(),
+                source: "custom",
+              }) || res.emit
+            );
+          }
+
+          // ★ High-score bypass: if the raw top is very confident, emit immediately
+          if (topLabel && topScore >= 0.80) {
+            return interpreterRef.current.step({
+              label: topLabel.toLowerCase(),
+              score: topScore,
+              landmarks: lm,
+              now: performance.now(),
+              source: "custom",
+            });
+          }
+
+          return null;
+        };
+
+        // 3) MediaPipe path
+        const tryMP = () => {
+          if (!mpLabel) return null;
+          return interpreterRef.current.step({
+            label: mpLabel,
+            score: mpScore,
+            landmarks: lm,
+            now: performance.now(),
+            source: "mp",
+          });
+        };
+
+        // 4) Preference logic
+        let phrase = null;
+        if (modelPref === "custom") {
+          phrase = tryCustom();
+        } else if (modelPref === "mp") {
+          phrase = tryMP();
+        } else {
+          // auto: prefer custom, fallback to MP
+          phrase = tryCustom() ?? tryMP();
+        }
+
+        if (phrase) appendSignerText(phrase);
+
+        //throttled debug HUD updates (~6 fps) 
+        const t = performance.now();
+        if (t - lastDebugAtRef.current > 150) {
+          lastDebugAtRef.current = t;
+          setDebug({
+            mpReady,
+            customReady,
+            modelPref,
+            mpLabel,
+            mpScore,
+            customLabel: dbgCustomLabel,
+            customScore: dbgCustomScore,
+          });
+        }
       }
       raf = requestAnimationFrame(loop);
     };
 
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [cameraOn, videoRef, canvasRef]);
+  }, [
+    cameraOn,
+    videoRef,
+    canvasRef,
+    mpReady,
+    recognizerRef,
+    customReady,
+    customStep,
+    modelPref,
+  ]);
 
+  //settings save (persist model pref too)
   const saveSettings = () => {
+    localStorage.setItem("modelPref", modelPref);
     setShowSaved(true);
     setTimeout(() => setShowSaved(false), 1500);
     setIsSettingsOpen(false);
@@ -168,10 +307,8 @@ export default function App() {
           </button>
         </div>
 
-        {/* Stepper */}
         <Stepper step={step} />
 
-        {/* Content */}
         <div className="p-4">
           {step === 0 && <Terms onStart={onStart} />}
           {step === 1 && (
@@ -183,15 +320,13 @@ export default function App() {
               input={input}
               setInput={setInput}
               onSend={onSend}
-              // camera props
               videoRef={videoRef}
               canvasRef={canvasRef}
               cameraOn={cameraOn}
+              debug={debug}
             />
           )}
-          {step === 2 && (
-            <Complete onExport={onExport} onRestartRequest={requestRestart} />
-          )}
+          {step === 2 && <Complete onExport={onExport} onRestartRequest={requestRestart} />}
         </div>
 
         {/* Settings drawer */}
@@ -199,9 +334,10 @@ export default function App() {
           <div className="fixed inset-0 bg-black/40 flex items-end justify-center z-50">
             <div className="w-[390px] bg-white rounded-t-2xl p-4">
               <div className="text-center font-semibold mb-2">Setting</div>
-              <div className="space-y-2">
+              <div className="space-y-3">
+                {/* Text size */}
                 <div className="border rounded-xl p-3">
-                  <div className="text-sm mb-2">Text</div>
+                  <div className="text-sm mb-2">Text size</div>
                   <div className="flex items-center gap-2">
                     <span className="text-xs">A</span>
                     <input
@@ -214,6 +350,43 @@ export default function App() {
                       className="w-full"
                     />
                     <span className="text-base">A</span>
+                  </div>
+                </div>
+
+                {/* Model Preference */}
+                <div className="border rounded-xl p-3">
+                  <div className="text-sm mb-2">Recognition model</div>
+                  <div className="flex flex-col gap-2 text-sm">
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        name="modelPref"
+                        value="auto"
+                        checked={modelPref === "auto"}
+                        onChange={(e) => setModelPref(e.target.value)}
+                      />
+                      <span>Auto (prefer Custom, fallback to MediaPipe)</span>
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        name="modelPref"
+                        value="custom"
+                        checked={modelPref === "custom"}
+                        onChange={(e) => setModelPref(e.target.value)}
+                      />
+                      <span>Prefer Custom model</span>
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="radio"
+                        name="modelPref"
+                        value="mp"
+                        checked={modelPref === "mp"}
+                        onChange={(e) => setModelPref(e.target.value)}
+                      />
+                      <span>Prefer MediaPipe</span>
+                    </label>
                   </div>
                 </div>
               </div>
@@ -252,7 +425,7 @@ export default function App() {
           </div>
         )}
 
-        {/* Restart Modal (Step 3) */}
+        {/* Restart Modal */}
         {showRestartModal && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
             <div className="w-[360px] bg-white rounded-2xl shadow-lg p-4">
